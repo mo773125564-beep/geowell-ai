@@ -1,0 +1,648 @@
+name: Build GeoWell AI APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.8'
+          channel: stable
+          cache: true
+
+      - name: Create and build GeoWell AI
+        shell: bash
+        run: |
+          flutter create --org com.geowell --project-name geowell_ai .
+
+          cat > pubspec.yaml <<'EOF'
+          name: geowell_ai
+          description: GeoWell AI - field assistant for groundwater site management.
+          publish_to: "none"
+          version: 1.0.0+1
+
+          environment:
+            sdk: ">=3.8.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            cupertino_icons: ^1.0.8
+            flutter_map: ^8.1.1
+            latlong2: ^0.9.1
+            geolocator: ^14.0.2
+            shared_preferences: ^2.5.3
+            pdf: ^3.11.3
+            printing: ^5.14.2
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^6.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+          cat > lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'dart:math' as math;
+          import 'package:flutter/material.dart';
+          import 'package:flutter_map/flutter_map.dart';
+          import 'package:latlong2/latlong.dart';
+          import 'package:geolocator/geolocator.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:pdf/widgets.dart' as pw;
+          import 'package:printing/printing.dart';
+
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const GeoWellApp());
+          }
+
+          class GeoWellApp extends StatelessWidget {
+            const GeoWellApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'GeoWell AI',
+                theme: ThemeData(
+                  useMaterial3: true,
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xFF00796B),
+                  ),
+                  scaffoldBackgroundColor: const Color(0xFFF5F8F7),
+                ),
+                home: const HomePage(),
+              );
+            }
+          }
+
+          class Site {
+            String name;
+            double lat;
+            double lon;
+            String notes;
+            bool successful;
+            double? depth;
+
+            Site({
+              required this.name,
+              required this.lat,
+              required this.lon,
+              this.notes = '',
+              this.successful = false,
+              this.depth,
+            });
+
+            Map<String, dynamic> toJson() => {
+              'name': name,
+              'lat': lat,
+              'lon': lon,
+              'notes': notes,
+              'successful': successful,
+              'depth': depth,
+            };
+
+            factory Site.fromJson(Map<String, dynamic> j) => Site(
+              name: j['name'] ?? 'نقطة',
+              lat: (j['lat'] as num).toDouble(),
+              lon: (j['lon'] as num).toDouble(),
+              notes: j['notes'] ?? '',
+              successful: j['successful'] ?? false,
+              depth: (j['depth'] as num?)?.toDouble(),
+            );
+          }
+
+          class SiteStore {
+            static const key = 'sites';
+
+            static Future<List<Site>> load() async {
+              final p = await SharedPreferences.getInstance();
+              final raw = p.getString(key);
+              if (raw == null) return [];
+              return (jsonDecode(raw) as List)
+                  .map((e) => Site.fromJson(e))
+                  .toList();
+            }
+
+            static Future<void> save(List<Site> sites) async {
+              final p = await SharedPreferences.getInstance();
+              await p.setString(
+                key,
+                jsonEncode(sites.map((e) => e.toJson()).toList()),
+              );
+            }
+          }
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            int tab = 0;
+            List<Site> sites = [];
+
+            @override
+            void initState() {
+              super.initState();
+              _load();
+            }
+
+            Future<void> _load() async {
+              sites = await SiteStore.load();
+              if (mounted) setState(() {});
+            }
+
+            Future<void> _addSite(LatLng p) async {
+              final name = TextEditingController(
+                text: 'نقطة ${sites.length + 1}',
+              );
+              final notes = TextEditingController();
+
+              final result =
+                  await showDialog<Map<String, String>>(
+                    context: context,
+                    builder: (_) => AlertDialog(
+                      title: const Text('إضافة نقطة'),
+                      content: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          TextField(
+                            controller: name,
+                            decoration: const InputDecoration(
+                              labelText: 'اسم النقطة',
+                            ),
+                          ),
+                          TextField(
+                            controller: notes,
+                            decoration: const InputDecoration(
+                              labelText: 'ملاحظات',
+                            ),
+                          ),
+                        ],
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('إلغاء'),
+                        ),
+                        FilledButton(
+                          onPressed: () => Navigator.pop(
+                            context,
+                            {
+                              'name': name.text,
+                              'notes': notes.text,
+                            },
+                          ),
+                          child: const Text('حفظ'),
+                        ),
+                      ],
+                    ),
+                  );
+
+              if (result == null) return;
+
+              sites.add(
+                Site(
+                  name: result['name']!,
+                  lat: p.latitude,
+                  lon: p.longitude,
+                  notes: result['notes']!,
+                ),
+              );
+
+              await SiteStore.save(sites);
+              setState(() {});
+
+              if (mounted) _showAnalysis(sites.last);
+            }
+
+            void _showAnalysis(Site site) {
+              final nearest = _nearest(site);
+              final similarity = _similarity(site);
+
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                builder: (_) => SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Text(
+                          'تحليل الموقع',
+                          style: Theme.of(context)
+                              .textTheme
+                              .headlineSmall
+                              ?.copyWith(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          '📍 ${site.lat.toStringAsFixed(6)}, ${site.lon.toStringAsFixed(6)}',
+                        ),
+                        const SizedBox(height: 8),
+                        _metric(
+                          'درجة المقارنة',
+                          '${similarity.toStringAsFixed(0)}%',
+                        ),
+                        _metric(
+                          'مؤشر أولي للموقع',
+                          '${(50 + similarity / 2).clamp(0, 100).toStringAsFixed(0)}%',
+                        ),
+                        if (nearest != null)
+                          Text(
+                            '📏 أقرب نقطة محفوظة: '
+                            '${_distance(site, nearest).toStringAsFixed(2)} كم',
+                          ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          '⚠️ هذا تقييم مساعد مبني على البيانات المحفوظة، '
+                          'وليس إثباتًا لوجود مياه جوفية أو تحديدًا مؤكدًا للعمق.',
+                        ),
+                        const SizedBox(height: 12),
+                        FilledButton.icon(
+                          onPressed: () => _report(site, similarity),
+                          icon: const Icon(Icons.picture_as_pdf),
+                          label: const Text('إنشاء تقرير PDF'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _metric(String label, String value) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(label)),
+                    Text(
+                      value,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Site? _nearest(Site s) {
+              if (sites.length < 2) return null;
+
+              Site? best;
+              double d = double.infinity;
+
+              for (final x in sites) {
+                if (x == s) continue;
+                final z = _distance(s, x);
+                if (z < d) {
+                  d = z;
+                  best = x;
+                }
+              }
+
+              return best;
+            }
+
+            double _distance(Site a, Site b) {
+              const r = 6371.0;
+              final p1 = a.lat * math.pi / 180;
+              final p2 = b.lat * math.pi / 180;
+              final dp = (b.lat - a.lat) * math.pi / 180;
+              final dl = (b.lon - a.lon) * math.pi / 180;
+
+              final h = math.sin(dp / 2) * math.sin(dp / 2) +
+                  math.cos(p1) *
+                      math.cos(p2) *
+                      math.sin(dl / 2) *
+                      math.sin(dl / 2);
+
+              return 2 * r * math.asin(math.sqrt(h));
+            }
+
+            double _similarity(Site s) {
+              final comparable = sites.where((x) => x != s).toList();
+              if (comparable.isEmpty) return 50;
+
+              final d = comparable
+                  .map((x) => _distance(s, x))
+                  .reduce(math.min);
+
+              return (100 * math.exp(-d / 5)).clamp(0, 100);
+            }
+
+            Future<void> _locate() async {
+              if (!await Geolocator.isLocationServiceEnabled()) return;
+
+              var perm = await Geolocator.checkPermission();
+
+              if (perm == LocationPermission.denied) {
+                perm = await Geolocator.requestPermission();
+              }
+
+              if (perm == LocationPermission.denied ||
+                  perm == LocationPermission.deniedForever) {
+                return;
+              }
+
+              final pos = await Geolocator.getCurrentPosition();
+
+              if (!mounted) return;
+
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => MapPage(
+                    initial: LatLng(pos.latitude, pos.longitude),
+                    onAdd: _addSite,
+                  ),
+                ),
+              );
+            }
+
+            Future<void> _report(Site site, double similarity) async {
+              final doc = pw.Document();
+
+              doc.addPage(
+                pw.Page(
+                  build: (_) => pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text('GeoWell AI'),
+                      pw.SizedBox(height: 20),
+                      pw.Text('تقرير موقع'),
+                      pw.Text(
+                        'الإحداثيات: ${site.lat}, ${site.lon}',
+                      ),
+                      pw.Text(
+                        'درجة المقارنة: ${similarity.toStringAsFixed(0)}%',
+                      ),
+                      pw.SizedBox(height: 20),
+                      pw.Text(
+                        'هذا التقرير أداة مساعدة ولا يثبت وجود مياه '
+                        'جوفية أو عمقًا مؤكدًا.',
+                      ),
+                    ],
+                  ),
+                ),
+              );
+
+              await Printing.layoutPdf(
+                onLayout: (_) async => doc.save(),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final body = tab == 0
+                  ? Dashboard(
+                      sites: sites,
+                      onMap: () => setState(() => tab = 1),
+                      onLocate: _locate,
+                    )
+                  : MapPage(
+                      initial: const LatLng(24.7136, 46.6753),
+                      onAdd: _addSite,
+                    );
+
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('GeoWell AI'),
+                  centerTitle: true,
+                ),
+                body: body,
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: tab,
+                  onDestinationSelected: (i) => setState(() => tab = i),
+                  destinations: const [
+                    NavigationDestination(
+                      icon: Icon(Icons.dashboard_outlined),
+                      selectedIcon: Icon(Icons.dashboard),
+                      label: 'الرئيسية',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.map_outlined),
+                      selectedIcon: Icon(Icons.map),
+                      label: 'الخريطة',
+                    ),
+                  ],
+                ),
+                floatingActionButton: tab == 0
+                    ? FloatingActionButton.extended(
+                        onPressed: _locate,
+                        icon: const Icon(Icons.location_on),
+                        label: const Text('موقع جديد'),
+                      )
+                    : null,
+              );
+            }
+          }
+
+          class Dashboard extends StatelessWidget {
+            final List<Site> sites;
+            final VoidCallback onMap;
+            final VoidCallback onLocate;
+
+            const Dashboard({
+              super.key,
+              required this.sites,
+              required this.onMap,
+              required this.onLocate,
+            });
+
+            @override
+            Widget build(BuildContext context) {
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(22),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      gradient: const LinearGradient(
+                        colors: [
+                          Color(0xFF004D40),
+                          Color(0xFF00897B),
+                        ],
+                      ),
+                    ),
+                    child: const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'مساعدك الميداني',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                        SizedBox(height: 6),
+                        Text(
+                          'تحليل مواقع الآبار',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 25,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Text(
+                          'اضغط على الخريطة لاختيار نقطة وتحليلها',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _card(
+                          'النقاط',
+                          '${sites.length}',
+                          Icons.place_outlined,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _card(
+                          'المواقع الناجحة',
+                          '${sites.where((s) => s.successful).length}',
+                          Icons.water_drop_outlined,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: onMap,
+                    icon: const Icon(Icons.map),
+                    label: const Text('فتح الخريطة'),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: onLocate,
+                    icon: const Icon(Icons.my_location),
+                    label: const Text('استخدام موقعي الحالي'),
+                  ),
+                ],
+              );
+            }
+
+            static Widget _card(
+              String a,
+              String b,
+              IconData i,
+            ) {
+              return Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Column(
+                  children: [
+                    Icon(i, size: 30),
+                    const SizedBox(height: 8),
+                    Text(
+                      b,
+                      style: const TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(a),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class MapPage extends StatefulWidget {
+            final LatLng initial;
+            final Future<void> Function(LatLng) onAdd;
+
+            const MapPage({
+              super.key,
+              required this.initial,
+              required this.onAdd,
+            });
+
+            @override
+            State<MapPage> createState() => _MapPageState();
+          }
+
+          class _MapPageState extends State<MapPage> {
+            late LatLng center;
+
+            @override
+            void initState() {
+              super.initState();
+              center = widget.initial;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return FlutterMap(
+                options: MapOptions(
+                  initialCenter: center,
+                  initialZoom: 14,
+                  onTap: (t, p) => widget.onAdd(p),
+                ),
+                children: [
+                  TileLayer(
+                    urlTemplate:
+                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    userAgentPackageName: 'com.geowell.geowell_ai',
+                  ),
+                  const RichAttributionWidget(
+                    attributions: [
+                      TextSourceAttribution(
+                        'OpenStreetMap contributors',
+                      ),
+                    ],
+                  ),
+                  const Center(
+                    child: IgnorePointer(
+                      child: Icon(
+                        Icons.add_location_alt,
+                        size: 44,
+                        color: Colors.teal,
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            }
+          }
+          EOF
+
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          marker = '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+          perms = '<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/><uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>'
+          if perms not in s:
+              s = s.replace(marker, marker + perms)
+          open(p, 'w').write(s)
+          PY
+
+          flutter pub get
+          flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: geowell-ai-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
